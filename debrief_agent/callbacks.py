@@ -1,15 +1,15 @@
-"""Observability, context/state management, and deterministic guardrail callbacks.
+"""Observability, context/memory management, PII redaction, and guardrail callbacks.
 
 Provides:
-- Safe session state initialization & multi-turn debrief history tracking
-- Per-stage structured logging and OpenTelemetry span enrichment
-- Skill/resource usage tracking for SkillToolset calls
-- Deterministic after-model guardrail enforcing the no Hire/No-Hire policy
+- Dedicated structured JSON logging with OTel trace/span correlation & active PII redaction
+- Safe session state initialization & async memory persistence (`add_session_to_memory`)
+- Explicit intent-vs-outcome tool call logging (`before_tool_callback` + `after_tool_callback`)
+- Per-stage latency tracing on OpenTelemetry spans
+- Deterministic after-model guardrail enforcing the no Hire/No-Hire policy & Markdown hygiene
 """
 
 from __future__ import annotations
 
-import logging
 import re
 import time
 from typing import Any
@@ -21,7 +21,10 @@ from google.adk.tools.tool_context import ToolContext
 from google.genai import types
 from opentelemetry import trace
 
-logger = logging.getLogger("debrief_agent.observability")
+from debrief_agent.logging_config import configure_structured_logging
+from debrief_agent.pii import redact_payload, redact_pii
+
+logger = configure_structured_logging("debrief_agent.observability")
 
 # Patterns matching explicit hiring verdict/recommendation statements while
 # avoiding false positives on policy disclaimers (e.g., "No Hire/No-Hire
@@ -94,11 +97,7 @@ def initialize_session_state(callback_context: CallbackContext) -> None:
 
 
 def initialize_pipeline_state(callback_context: CallbackContext) -> None:
-    """Initializes required session state keys before the pipeline runs.
-
-    Prevents template KeyErrors on downstream state placeholders and tracks
-    multi-turn debrief metadata within the session.
-    """
+    """Initializes required session state keys before the pipeline runs."""
     state = callback_context.state
     state.setdefault("extracted_signals", "")
     state.setdefault("audit_flags", "")
@@ -121,8 +120,8 @@ def initialize_pipeline_state(callback_context: CallbackContext) -> None:
     )
 
 
-def finalize_pipeline_state(callback_context: CallbackContext) -> None:
-    """Records end-to-end latency and appends a compact summary to session history."""
+async def finalize_pipeline_state(callback_context: CallbackContext) -> None:
+    """Records latency, scrubs PII, and persists session to long-term memory asynchronously."""
     state = callback_context.state
     start_ts = state.get("_pipeline_start_ts")
     duration_ms = (
@@ -130,6 +129,16 @@ def finalize_pipeline_state(callback_context: CallbackContext) -> None:
         if start_ts is not None
         else None
     )
+
+    # Scrub PII from stored debrief state before persisting to memory/history.
+    if isinstance(state.get("final_debrief"), str) and state["final_debrief"]:
+        redacted_debrief, pii_types = redact_pii(state["final_debrief"])
+        if pii_types:
+            state["final_debrief"] = redacted_debrief
+            logger.info(
+                "Redacted PII from final_debrief prior to memory persistence",
+                extra={"event": "pii_redacted", "pii_types": pii_types},
+            )
 
     history = list(state.get("debrief_history", []))
     history.append(
@@ -143,11 +152,27 @@ def finalize_pipeline_state(callback_context: CallbackContext) -> None:
     # Cap in-session history to the 10 most recent debriefs to bound state size.
     state["debrief_history"] = history[-10:]
 
+    memory_persisted = False
+    if hasattr(callback_context, "add_session_to_memory"):
+        try:
+            await callback_context.add_session_to_memory()
+            memory_persisted = True
+        except ValueError:
+            # Memory service not configured on this runner (e.g., lightweight unit test).
+            memory_persisted = False
+        except Exception as exc:
+            logger.warning(
+                "Async memory persistence skipped: %s",
+                type(exc).__name__,
+                extra={"event": "memory_persist_error", "error": str(exc)},
+            )
+
     span = trace.get_current_span()
     if duration_ms is not None:
         span.set_attribute("debrief.pipeline.duration_ms", duration_ms)
     if skill := state.get("active_rubric_skill"):
         span.set_attribute("debrief.skill.active", str(skill))
+    span.set_attribute("debrief.memory.persisted", memory_persisted)
 
     logger.info(
         "Debrief pipeline completed",
@@ -156,6 +181,7 @@ def finalize_pipeline_state(callback_context: CallbackContext) -> None:
             "agent_name": callback_context.agent_name,
             "active_skill": state.get("active_rubric_skill", "unknown"),
             "duration_ms": duration_ms,
+            "memory_persisted": memory_persisted,
         },
     )
 
@@ -194,16 +220,54 @@ def record_stage_end(callback_context: CallbackContext) -> None:
     )
 
 
-def trace_skill_tool_call(
+def log_tool_intent(
     tool: BaseTool,
     args: dict[str, Any],
     tool_context: ToolContext,
-    tool_response: dict[str, Any],
 ) -> None:
-    """Tracks SkillToolset invocations in session state and OpenTelemetry spans."""
-    span = trace.get_current_span()
+    """Logs explicit tool-call intent before execution (intent-vs-outcome tracing)."""
     tool_name = tool.name
+    tool_context.state[f"_tool_start_{tool_name}"] = time.perf_counter()
+
+    safe_args = redact_payload({k: str(v)[:200] for k, v in args.items()})
+    span = trace.get_current_span()
+    span.set_attribute("debrief.tool.intent.name", tool_name)
+
+    logger.info(
+        "Tool call intent recorded",
+        extra={
+            "event": "tool_intent",
+            "tool_name": tool_name,
+            "tool_args": safe_args,
+        },
+    )
+
+
+def log_tool_outcome(
+    tool: BaseTool,
+    args: dict[str, Any],
+    tool_context: ToolContext,
+    tool_response: dict[str, Any] | Any,
+) -> None:
+    """Logs tool execution outcome, duration, and SkillToolset state after execution."""
+    tool_name = tool.name
+    start_ts = tool_context.state.get(f"_tool_start_{tool_name}")
+    duration_ms = (
+        round((time.perf_counter() - float(start_ts)) * 1000, 2)
+        if start_ts is not None
+        else None
+    )
+
+    outcome_status = (
+        str(tool_response.get("status", "ok"))
+        if isinstance(tool_response, dict)
+        else "ok"
+    )
+    span = trace.get_current_span()
     span.set_attribute("debrief.tool.name", tool_name)
+    span.set_attribute("debrief.tool.outcome.status", outcome_status)
+    if duration_ms is not None:
+        span.set_attribute("debrief.tool.duration_ms", duration_ms)
 
     if tool_name == "load_skill" and (skill_name := args.get("skill_name")):
         tool_context.state["active_rubric_skill"] = skill_name
@@ -218,20 +282,25 @@ def trace_skill_tool_call(
             span.set_attribute("debrief.skill.resource_loaded", str(resource_path))
 
     logger.info(
-        "Skill tool executed",
+        "Tool call outcome recorded",
         extra={
-            "event": "skill_tool_call",
+            "event": "tool_outcome",
             "tool_name": tool_name,
-            "tool_args": {k: str(v) for k, v in args.items()},
+            "outcome_status": outcome_status,
+            "duration_ms": duration_ms,
         },
     )
+
+
+# Backwards-compatible alias for earlier imports.
+trace_skill_tool_call = log_tool_outcome
 
 
 def enforce_no_hire_guardrail(
     callback_context: CallbackContext,
     llm_response: LlmResponse,
 ) -> LlmResponse | None:
-    """Deterministic guardrail ensuring the synthesizer never emits a Hire/No-Hire verdict."""
+    """Deterministic guardrail ensuring no Hire/No-Hire verdict & clean Markdown."""
     if not llm_response.content or not llm_response.content.parts:
         return None
 

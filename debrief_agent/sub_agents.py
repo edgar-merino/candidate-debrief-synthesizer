@@ -19,20 +19,31 @@ from google.genai import types
 
 from debrief_agent.callbacks import (
     enforce_no_hire_guardrail,
+    log_tool_intent,
+    log_tool_outcome,
     record_stage_end,
     record_stage_start,
-    trace_skill_tool_call,
 )
 
 load_dotenv()
 
 DEFAULT_MODEL = "gemini-3.8-flash"
+DEFAULT_REASONING_MODEL = "gemini-3.1-pro-preview"
 SKILLS_DIR = Path(__file__).parent / "skills"
 
 
-def _build_model() -> Gemini:
-    """Builds the configured Gemini model from ADK_MODEL (default: gemini-3.8-flash)."""
-    model_name = os.getenv("ADK_MODEL", DEFAULT_MODEL)
+def _build_fast_model() -> Gemini:
+    """Builds the low-latency model for extraction & formatting (ADK_FAST_MODEL / ADK_MODEL)."""
+    model_name = os.getenv("ADK_FAST_MODEL") or os.getenv("ADK_MODEL", DEFAULT_MODEL)
+    return Gemini(
+        model=model_name,
+        retry_options=types.HttpRetryOptions(attempts=3),
+    )
+
+
+def _build_reasoning_model() -> Gemini:
+    """Builds the high-precision reasoning model for bias & gap auditing (ADK_REASONING_MODEL)."""
+    model_name = os.getenv("ADK_REASONING_MODEL", DEFAULT_REASONING_MODEL)
     return Gemini(
         model=model_name,
         retry_options=types.HttpRetryOptions(attempts=3),
@@ -54,7 +65,8 @@ def build_rubric_toolset(skills_dir: Path = SKILLS_DIR) -> SkillToolset:
 
 
 rubric_toolset = build_rubric_toolset()
-_model = _build_model()
+_fast_model = _build_fast_model()
+_reasoning_model = _build_reasoning_model()
 _fast_reasoning_config = types.GenerateContentConfig(
     temperature=0.1,
     thinking_config=types.ThinkingConfig(thinking_level=types.ThinkingLevel.LOW),
@@ -66,7 +78,7 @@ _fast_formatting_config = types.GenerateContentConfig(
 
 signal_extractor = LlmAgent(
     name="signal_extractor",
-    model=_model,
+    model=_fast_model,
     generate_content_config=_fast_reasoning_config,
     description=(
         "Identifies interview type and target level, loads the matching ADK rubric "
@@ -105,12 +117,13 @@ Follow these steps strictly in order (minimize tool round-trips):
     output_key="extracted_signals",
     before_agent_callback=record_stage_start,
     after_agent_callback=record_stage_end,
-    after_tool_callback=trace_skill_tool_call,
+    before_tool_callback=log_tool_intent,
+    after_tool_callback=log_tool_outcome,
 )
 
 gap_auditor = LlmAgent(
     name="gap_auditor",
-    model=_model,
+    model=_reasoning_model,
     generate_content_config=_fast_reasoning_config,
     include_contents="none",
     description=(
@@ -144,7 +157,7 @@ Be strictly grounded in `{extracted_signals}`. Do NOT invent facts or make any h
 
 debrief_synthesizer = LlmAgent(
     name="debrief_synthesizer",
-    model=_model,
+    model=_fast_model,
     generate_content_config=_fast_formatting_config,
     include_contents="none",
     description=(

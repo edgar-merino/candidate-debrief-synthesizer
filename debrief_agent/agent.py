@@ -14,7 +14,6 @@
 
 """Root agent entry point for the Candidate Debrief & Rubric Synthesizer."""
 
-import logging
 import os
 
 from dotenv import load_dotenv
@@ -29,17 +28,25 @@ from debrief_agent.callbacks import (
     finalize_pipeline_state,
     initialize_pipeline_state,
     initialize_session_state,
+    log_tool_intent,
+    log_tool_outcome,
 )
+from debrief_agent.logging_config import configure_structured_logging
 from debrief_agent.sub_agents import (
     DEFAULT_MODEL,
     debrief_synthesizer,
     gap_auditor,
     signal_extractor,
 )
+from debrief_agent.tools import (
+    export_debrief_artifact,
+    recall_prior_debriefs,
+    validate_interview_notes,
+)
 
 load_dotenv()
 
-logger = logging.getLogger("debrief_agent")
+logger = configure_structured_logging("debrief_agent")
 
 
 def _build_plugins() -> list[BasePlugin]:
@@ -99,7 +106,7 @@ root_agent = LlmAgent(
     # manifest's value.
     name="debrief_coordinator",
     model=Gemini(
-        model=os.getenv("ADK_MODEL", DEFAULT_MODEL),
+        model=os.getenv("ADK_FAST_MODEL") or os.getenv("ADK_MODEL", DEFAULT_MODEL),
         retry_options=types.HttpRetryOptions(attempts=3),
     ),
     generate_content_config=types.GenerateContentConfig(
@@ -108,40 +115,46 @@ root_agent = LlmAgent(
     ),
     description=(
         "Interactive conversational entry point for the Candidate Debrief & "
-        "Rubric Synthesizer. Guides interviewers, answers questions about "
-        "rubrics or prior debriefs, and delegates raw interview notes to "
-        "debrief_pipeline."
+        "Rubric Synthesizer. Validates notes, recalls prior debrief memories, "
+        "exports artifacts with HITL approval, and delegates full debrief "
+        "synthesis to debrief_pipeline."
     ),
     instruction="""You are the interactive Coordinator for the **Candidate Debrief & Rubric Synthesizer**.
 
 Your role is to provide a natural, helpful conversational experience while routing actual
 interview-note evaluations to the deterministic 3-stage `debrief_pipeline` sub-agent.
 
+### Available Tools & When to Use Them
+- `validate_interview_notes`: Use when notes look very short, ambiguous, or specify an
+  unusual level (e.g., L6/L7) — follow its `recovery_hint` if it returns `status="error"`.
+- `recall_prior_debriefs`: Use when the interviewer asks about prior candidate debriefs,
+  earlier rounds, or cross-session rubric calibration history.
+- `export_debrief_artifact`: Use ONLY when the interviewer explicitly asks to export or
+  save the generated debrief as an artifact. This tool pauses for explicit human
+  interviewer confirmation before persisting the PII-redacted Markdown file.
+
 ### When to Respond Directly (DO NOT transfer to `debrief_pipeline`)
-1. **Greetings & Capabilities:** If the user says hello or asks what you do, briefly explain
-   that you transform raw technical interview notes (**System Design**, **Coding**, or
-   **Behavioral**) into objective, level-calibrated (**L3 / L4 / L5**) debriefs with bias/gap
-   auditing and follow-up questions—and invite them to paste their notes (plus optional target
-   level and any specific core competencies they want rated).
-2. **Missing Notes / Clarification:** If the user asks to evaluate a candidate (e.g., "Help me
-   write an L4 debrief") without providing any interview notes yet, ask them concisely to paste
-   the raw notes and confirm the target level (`L3`, `L4`, or `L5`) and interview type.
+1. **Greetings & Capabilities:** Briefly explain that you transform raw technical interview
+   notes (**System Design**, **Coding**, or **Behavioral**) into objective, level-calibrated
+   (**L3 / L4 / L5**) debriefs with bias/gap auditing and follow-up questions—and invite them
+   to paste their notes.
+2. **Missing Notes / Clarification:** If the user asks to evaluate a candidate without
+   providing notes yet, ask them concisely to paste the raw notes and confirm the target
+   level (`L3`, `L4`, or `L5`) and interview type.
 3. **Questions About Rubrics or Process:** Answer clearly about the supported rubrics
    (`system-design-rubric`, `coding-rubric`, `behavioral-rubric`), levels (`L3`, `L4`, `L5`),
    rating scale (`Strong`, `Meets Bar`, `Developing`, `Poor`, `Not Assessed`), and the
    no-Hire/No-Hire human-in-the-loop guardrail.
 4. **Follow-Up Questions on an Existing Debrief:** If a debrief has already been generated in
    this session (see `<last_debrief>` and `<last_audit_flags>` below) and the user asks to
-   clarify a rating, explain a bias flag, or tailor/add follow-up questions, respond directly
+   clarify a rating, explain a bias flag, or tailor follow-up questions, respond directly
    and concisely using that session context.
 
 ### When to Delegate Immediately (`transfer_to_agent` -> `debrief_pipeline`)
 - Whenever the user pastes raw interview notes or observations to evaluate.
 - Whenever the user asks to **re-evaluate** previously provided notes at a different target
-  level (e.g., "Now evaluate that same candidate for L3 instead of L4") or with a full
-  regenerated debrief.
-- Do NOT try to synthesize a full rubric debrief yourself—always delegate to `debrief_pipeline`
-  so the ADK `SkillToolset` rubrics, `gap_auditor`, and `debrief_synthesizer` run deterministically.
+  level (e.g., "Now evaluate that same candidate for L3 instead of L4").
+- Do NOT synthesize a full rubric debrief yourself—always delegate to `debrief_pipeline`.
 
 ### Strict Guardrail
 NEVER output a Hire, No-Hire, Strong Hire, Lean Hire, or numeric hiring decision/score in
@@ -155,9 +168,15 @@ conversation. All hiring judgment belongs exclusively to the human interviewer.
 {final_debrief}
 </last_debrief>
 """,
-    tools=[],
+    tools=[
+        validate_interview_notes,
+        recall_prior_debriefs,
+        export_debrief_artifact,
+    ],
     sub_agents=[debrief_pipeline],
     before_agent_callback=initialize_session_state,
+    before_tool_callback=log_tool_intent,
+    after_tool_callback=log_tool_outcome,
     after_model_callback=enforce_no_hire_guardrail,
 )
 
