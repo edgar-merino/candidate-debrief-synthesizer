@@ -1,0 +1,11 @@
+Interview: L5 System Design (Cloud AI Engineer / TSC)
+Prompt: Design a multi-tenant Enterprise Document Q&A and RAG platform serving 50,000 internal employees across 40 enterprise tenants with <2.5s p95 latency and strict freshness (<5 min from doc update).
+
+Raw Notes (taken live, messy):
+- Intro: candidate seemed a bit hesitant at first, maybe nervous, took ~3 mins before starting to whiteboard. Once they got going they felt like a good culture fit.
+- Requirements: Before drawing boxes, candidate immediately asked about tenant count, doc size distribution, update frequency, p95 latency SLA, and whether answers need inline citations. Scoped MVP as PDF/Markdown/HTML first, deferring OCR-heavy scanned docs to phase 2.
+- Ingestion & Architecture: Proposed event-driven ingestion (GCS -> Pub/Sub -> Cloud Run workers -> chunking + embedding -> Vector Search + BM25 hybrid index). Independently compared dense-only vector search vs hybrid (BM25 + dense + cross-encoder reranker) — noted exact SKU/policy IDs fail with dense-only embeddings and justified the ~120ms reranker latency budget against the 2.5s p95 target.
+- Back-of-the-envelope math: Estimated ~2M docs, avg 10 chunks/doc = 20M vectors, calculated rough index memory footprint and QPS (~300 peak QPS) unprompted.
+- Scaling / Failure Modes: When asked about LLM quota limits at peak load, candidate initially only mentioned simple exponential backoff. I gave a hint about what happens if a single tenant spikes or the primary model region has an outage. After the hint, candidate added per-tenant token-bucket rate limiting, a semantic cache for repeated HR/IT queries, and a fallback to a lighter flash model with circuit breaking.
+- Also mentioned idempotent ingestion workers with a DLQ for malformed PDFs (unclear if they would have brought up multi-region failover on their own — we ran short on time).
+- Ran out of time at minute 43 — did not get to discuss tenant-level ACL enforcement at retrieval time, PII redaction, prompt-injection guardrails, or production observability/eval pipelines.

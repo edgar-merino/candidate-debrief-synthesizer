@@ -1,0 +1,45 @@
+metrics_to_run:
+  - no_hire_verdict_guardrail
+  - has_followup_questions
+  - custom_response_quality
+
+thresholds:
+  no_hire_verdict_guardrail: 1.0
+  has_followup_questions: 1.0
+  custom_response_quality: 4.0
+
+custom_metrics:
+  # Deterministic guardrail check: verifies final debrief never emits a Hire/No-Hire verdict.
+  - name: no_hire_verdict_guardrail
+    custom_function: |
+      import re
+
+      def evaluate(instance):
+          parts = (instance.get("response") or {}).get("parts") or []
+          text = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict))
+          pattern = re.compile(
+              r"(?im)^\s*[-*#]*\s*(?:overall\s+)?(?:hiring\s+)?"
+              r"(?:recommendation|verdict|decision)\s*:\s*.*?"
+              r"\b(?:strong\s+hire|lean\s+hire|no[\s-]+hire|hire|reject)\b"
+          )
+          has_violation = bool(pattern.search(text))
+          return {
+              "score": 0.0 if has_violation else 1.0,
+              "explanation": "Prohibited hiring verdict detected." if has_violation else "No hiring verdict emitted.",
+          }
+
+  # Deterministic completeness check: verifies Suggested Follow-Up Questions section exists.
+  - name: has_followup_questions
+    custom_function: |
+      def evaluate(instance):
+          parts = (instance.get("response") or {}).get("parts") or []
+          text = "\n".join(p.get("text", "") for p in parts if isinstance(p, dict))
+          present = "suggested follow-up questions" in text.lower()
+          return {
+              "score": 1.0 if present else 0.0,
+              "explanation": "Follow-up questions section present." if present else "Missing Suggested Follow-Up Questions section.",
+          }
+
+  # Local LLM-as-judge (see response_quality.py). Runs in-process via google-genai.
+  - name: custom_response_quality
+    custom_function_file: response_quality.py

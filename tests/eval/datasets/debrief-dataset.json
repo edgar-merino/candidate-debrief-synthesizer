@@ -1,0 +1,26 @@
+{
+  "eval_cases": [
+    {
+      "eval_case_id": "l5_system_design_bias_and_gap_audit",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Interview: L5 System Design (Cloud AI Engineer / TSC)\nRaw Notes:\n- Candidate seemed a bit hesitant at first, maybe nervous, felt like a good culture fit.\n- Immediately clarified tenant count (40 tenants), p95 latency (<2.5s), and freshness (<5 min).\n- Independently compared dense-only vs hybrid BM25 + vector search + cross-encoder reranker and budgeted 120ms for reranking.\n- On LLM quota spikes, initially only said exponential backoff; after a hint about noisy neighbors, added per-tenant token-bucket rate limiting and flash-model fallback.\n- Ran out of time before discussing tenant ACLs, PII redaction, prompt-injection guardrails, or observability."
+          }
+        ]
+      }
+    },
+    {
+      "eval_case_id": "l3_coding_missing_edge_cases",
+      "prompt": {
+        "role": "user",
+        "parts": [
+          {
+            "text": "Interview: L3 Coding (Cloud AI Engineer)\nRaw Notes:\n- Candidate was very likable and energetic.\n- Clarified input list format and wrote a clean O(n) hash map solution in Python with readable variable names.\n- Declared done without tracing an example; after I prompted about empty lists, added a guard check.\n- Did not ask about or test duplicate keys or null inputs."
+          }
+        ]
+      }
+    }
+  ]
+}
